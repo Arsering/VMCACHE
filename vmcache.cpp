@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <cassert>
 #include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <fcntl.h>
 #include <functional>
@@ -22,8 +25,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <immintrin.h>
+#include <random>
+
 
 #include "exmap.h"
+#include "tools.h"
 
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
@@ -586,8 +592,9 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
-BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
+BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 1024)*gb), physSize(envOr("PHYSMB", 4)*mb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
+
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
    if (blockfd == -1) {
@@ -637,11 +644,11 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    writeCount = 0;
    batch = envOr("BATCH", 64);
 
-   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
+   cerr << "vmcache " << "blk:" << path << " virtmb:" << virtSize/mb << " physmb:" << physSize/mb << " exmap:" << useExmap << endl;
 }
 
 void BufferManager::ensureFreePages() {
-   if (physUsedCount >= physCount*0.95)
+   if (physUsedCount >= physCount*0.99)
       evict();
 }
 
@@ -1689,22 +1696,31 @@ struct vmcacheAdapter
 template<class Fn>
 void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    std::vector<std::thread> threads;
+
    uint64_t n = end-begin;
    if (n<nthreads)
       nthreads = n;
    uint64_t perThread = n/nthreads;
+
    for (unsigned i=0; i<nthreads; i++) {
       threads.emplace_back([&,i]() {
          uint64_t b = (perThread*i) + begin;
          uint64_t e = (i==(nthreads-1)) ? end : (b+perThread);
-         fn(i, b, e);
+         // fn(i, b, e);
+         fn(i, begin, end);
       });
    }
    for (auto& t : threads)
       t.join();
 }
 
+struct PageNode{
+   uint64_t payload[512];
+};
+
+
 int main(int argc, char** argv) {
+
    if (bm.useExmap) {
       struct sigaction action;
       action.sa_flags = SA_SIGINFO;
@@ -1715,7 +1731,7 @@ int main(int argc, char** argv) {
       }
    }
 
-   unsigned nthreads = envOr("THREADS", 1);
+   size_t nthreads = envOr("THREAD", 1);
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
@@ -1786,6 +1802,107 @@ int main(int argc, char** argv) {
          }
          txProgress += cnt;
       });
+
+      statThread.join();
+      return 0;
+   }
+
+
+   bool rnd_file_IO = true;
+   if(rnd_file_IO){
+
+      auto statFn = [&]() {
+         std::string device_name = "nvme0n1";
+         size_t last_SSD_read_bytes,last_SSD_write_bytes,cur_SSD_read_bytes,cur_SSD_write_bytes;
+         size_t time_before = 0, time_after = 0;
+
+         std::tie(last_SSD_read_bytes, last_SSD_write_bytes) = SSD_io_bytes(device_name);
+         time_before = get_time_in_ms();
+
+         while(keepRunning) {
+            sleep(1);
+            std::tie(cur_SSD_read_bytes, cur_SSD_write_bytes) = SSD_io_bytes(device_name);
+            time_after = get_time_in_ms();
+
+            u64 prog = txProgress.exchange(0)*1e6/(time_after-time_before);
+            float rgb = (cur_SSD_read_bytes-last_SSD_read_bytes)/(1024.0*1024*1024);
+            float wgb = (cur_SSD_write_bytes-last_SSD_write_bytes)/(1024.0*1024*1024);
+
+            cout << prog * 4.0 /1024 /1024 << " " << rgb << " " << wgb << endl;
+
+            last_SSD_read_bytes = cur_SSD_read_bytes;
+            last_SSD_write_bytes = cur_SSD_write_bytes;
+            time_before = time_after;
+         }
+      };
+
+      thread statThread(statFn);
+
+      // parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+      //    workerThreadId = worker;
+
+      //    for (u64 i=begin; i<end; i++) {
+      //       GuardO<PageNode> page(i);
+      //       page->payload[0] = i;
+      //    }
+      // });
+      if(true){
+         parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+            workerThreadId = worker;
+            
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint64_t> rnd(begin, end-1);
+
+            while(true) {
+               auto page_id = rnd(gen);
+               GuardO<PageNode> page(page_id);
+               if(page->payload[0] != page_id*512){
+                  cerr << "data error" << page_id << endl;
+                  exit(0);
+               }
+               txProgress++;
+            }
+         });
+      }
+
+      if(false){
+         sleep(10);
+         std::string file_path = getenv("BLOCK");
+         size_t file_size_inByte = envOr("DATASIZE", 10)*4096;
+         auto data_file = ::open(file_path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0777);
+         assert(data_file != -1);
+         ::ftruncate(data_file, file_size_inByte);
+
+         auto data_file_mmaped = (char*) ::mmap(
+            NULL, file_size_inByte, PROT_READ | PROT_WRITE, MAP_SHARED, data_file, 0);
+         assert(data_file_mmaped != nullptr);
+         ::madvise(data_file_mmaped, file_size_inByte,MADV_RANDOM);  // Turn off readahead
+
+         parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+            workerThreadId = worker;
+            
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint64_t> rnd(begin, end-1);
+
+            size_t data_id;
+            // while(true) {
+            //    auto page_id = rnd(gen);
+            //    if(*reinterpret_cast<size_t*>(data_file_mmaped + page_id*4096) != page_id*512){
+            //       cerr << "data error" << page_id << endl;
+            //       exit(0);
+            //    }
+            //    data_id = page_id*512;
+            //    // memcpy(data_file_mmaped + data_id*8, &data_id, sizeof(size_t));
+            //    txProgress++;
+            // }
+            for(size_t data_id = 0;data_id < file_size_inByte/8;data_id++){
+               memcpy(data_file_mmaped + data_id*8, &data_id, sizeof(size_t));
+            }
+            keepRunning = false;
+         });
+      }
 
       statThread.join();
       return 0;
